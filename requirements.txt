@@ -1,0 +1,7 @@
+runpod
+torch
+torchaudio
+transformers
+accelerate
+scipy
+qwen-tts

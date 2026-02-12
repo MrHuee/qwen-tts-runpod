@@ -10,6 +10,14 @@ import numpy as np
 from qwen_tts import Qwen3TTSModel
 import whisper_timestamped as whisper
 
+# --- ⚡ PERFORMANCE FIX 1: THREAD LIMITING ---
+# Prevent CPU from spawning 152 threads and choking the system
+# We limit this to 4 threads, which is optimal for most RunPod containers.
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+torch.set_num_threads(4)
+torch.set_num_interop_threads(2)
+
 # --- Configuration ---
 MODEL_IDS = {
     "voice_design": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
@@ -23,32 +31,37 @@ WHISPER_MODEL = None
 
 def load_target_model(target_mode):
     global CURRENT_MODEL, CURRENT_MODE
-# ... (keep existing cleanup code) ...
+    if CURRENT_MODE == target_mode and CURRENT_MODEL is not None:
+        return CURRENT_MODEL
+
+    if CURRENT_MODEL is not None:
+        del CURRENT_MODEL
+        CURRENT_MODEL = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
     model_id = MODEL_IDS.get(target_mode)
-    print(f"--- 🚀 Loading {target_mode}... ---")
-    
+    if not model_id: raise ValueError(f"Invalid mode: {target_mode}")
+
+    print(f"--- 🚀 Loading {target_mode} on GPU... ---")
     try:
-        # 1. Force bfloat16 if available (A40 supports it)
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        
-        # 2. explicit device map and flash attention
+        # --- ⚡ PERFORMANCE FIX 2: FLASH ATTENTION ---
+        # Force the model to use the GPU and fast attention kernels
         model = Qwen3TTSModel.from_pretrained(
             model_id, 
             device_map="cuda", 
-            dtype=dtype, 
+            torch_dtype=torch.float16,
             attn_implementation="flash_attention_2"
         )
-        
-        # 3. CRITICAL: Sanity check to ensure model is actually on GPU
-        # If the wrapper exposes the internal model, force it (safeguard)
-        if hasattr(model, 'model'):
-            print(f"Model loaded on: {model.model.device}")
-            
+        print("✅ Flash Attention 2 enabled.")
     except Exception as e:
-        print(f"Warning: Flash Attention load failed, falling back. Error: {e}")
-        model = Qwen3TTSModel.from_pretrained(model_id, device_map="cuda", dtype=torch.float16)
-
+        print(f"⚠️ Flash Attention load failed, falling back. Error: {e}")
+        model = Qwen3TTSModel.from_pretrained(
+            model_id, 
+            device_map="cuda", 
+            torch_dtype=torch.float16
+        )
+        
     CURRENT_MODEL = model
     CURRENT_MODE = target_mode
     return model
@@ -92,6 +105,7 @@ def handler(job):
         model = load_target_model(mode)
         wavs, sr = None, None
 
+        print(f"--- 🗣️ Generating audio (Threads: {torch.get_num_threads()})... ---")
         if mode == "voice_design":
             instruct = job_input.get("instruct", "Clear voice.")
             wavs, sr = model.generate_voice_design(text=text, language=language, instruct=instruct)
@@ -103,21 +117,17 @@ def handler(job):
             ref_text = job_input.get("ref_text")
             wavs, sr = model.generate_voice_clone(text=text, language=language, ref_audio=ref_audio, ref_text=ref_text)
 
-        # --- ROBUST AUDIO SAVING (FIXED) ---
+        # --- AUDIO SAVING ---
         raw_audio = wavs[0]
 
-        # Check if it's a NumPy array (which caused the error) or a Tensor
         if isinstance(raw_audio, np.ndarray):
-            # Convert NumPy array to PyTorch Tensor
             audio_tensor = torch.from_numpy(raw_audio).float()
         elif torch.is_tensor(raw_audio):
-            # If it is a Tensor, ensure it's on CPU
+            # Ensure tensor is moved to CPU before saving to avoid blocking GPU
             audio_tensor = raw_audio.detach().cpu().float()
         else:
-            # Fallback if type is unknown (though unlikely)
             raise ValueError(f"Unexpected audio data type: {type(raw_audio)}")
         
-        # Ensure it is 2D (Channels, Time) for torchaudio
         if audio_tensor.dim() == 1:
             audio_tensor = audio_tensor.unsqueeze(0)
 

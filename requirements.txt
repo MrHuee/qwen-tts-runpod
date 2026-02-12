@@ -4,6 +4,7 @@ torchaudio
 transformers
 accelerate
 scipy
+numpy<2.0
 qwen-tts
 openai-whisper
 whisper-timestamped

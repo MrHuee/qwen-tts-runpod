@@ -6,7 +6,6 @@ import base64
 import gc
 import os
 import tempfile
-# Explicitly import numpy to debug availability if needed
 import numpy as np 
 from qwen_tts import Qwen3TTSModel
 import whisper_timestamped as whisper
@@ -99,10 +98,19 @@ def handler(job):
             ref_text = job_input.get("ref_text")
             wavs, sr = model.generate_voice_clone(text=text, language=language, ref_audio=ref_audio, ref_text=ref_text)
 
-        # --- ROBUST AUDIO SAVING ---
-        # wavs[0] is a Tensor on GPU.
-        # We use torchaudio to save it to memory buffer directly to avoid Numpy issues.
-        audio_tensor = wavs[0].cpu().float()
+        # --- ROBUST AUDIO SAVING (FIXED) ---
+        raw_audio = wavs[0]
+
+        # Check if it's a NumPy array (which caused the error) or a Tensor
+        if isinstance(raw_audio, np.ndarray):
+            # Convert NumPy array to PyTorch Tensor
+            audio_tensor = torch.from_numpy(raw_audio).float()
+        elif torch.is_tensor(raw_audio):
+            # If it is a Tensor, ensure it's on CPU
+            audio_tensor = raw_audio.detach().cpu().float()
+        else:
+            # Fallback if type is unknown (though unlikely)
+            raise ValueError(f"Unexpected audio data type: {type(raw_audio)}")
         
         # Ensure it is 2D (Channels, Time) for torchaudio
         if audio_tensor.dim() == 1:

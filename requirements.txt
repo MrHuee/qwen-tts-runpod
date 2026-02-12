@@ -5,6 +5,9 @@ transformers
 accelerate
 scipy
 numpy<2.0
-qwen-tts
 openai-whisper
 whisper-timestamped
+# Critical: Install Qwen directly from GitHub to fix the CPU fallback bug
+git+https://github.com/QwenLM/Qwen3-TTS.git
+# Critical: Required for GPU acceleration
+flash-attn

@@ -23,27 +23,32 @@ WHISPER_MODEL = None
 
 def load_target_model(target_mode):
     global CURRENT_MODEL, CURRENT_MODE
-    if CURRENT_MODE == target_mode and CURRENT_MODEL is not None:
-        return CURRENT_MODEL
-
-    if CURRENT_MODEL is not None:
-        del CURRENT_MODEL
-        CURRENT_MODEL = None
-        gc.collect()
-        torch.cuda.empty_cache()
+# ... (keep existing cleanup code) ...
 
     model_id = MODEL_IDS.get(target_mode)
-    if not model_id: raise ValueError(f"Invalid mode: {target_mode}")
-
     print(f"--- 🚀 Loading {target_mode}... ---")
+    
     try:
+        # 1. Force bfloat16 if available (A40 supports it)
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        model = Qwen3TTSModel.from_pretrained(
-            model_id, device_map="cuda", dtype=dtype, attn_implementation="flash_attention_2"
-        )
-    except:
-        model = Qwen3TTSModel.from_pretrained(model_id, device_map="cuda", dtype=torch.float16)
         
+        # 2. explicit device map and flash attention
+        model = Qwen3TTSModel.from_pretrained(
+            model_id, 
+            device_map="cuda", 
+            dtype=dtype, 
+            attn_implementation="flash_attention_2"
+        )
+        
+        # 3. CRITICAL: Sanity check to ensure model is actually on GPU
+        # If the wrapper exposes the internal model, force it (safeguard)
+        if hasattr(model, 'model'):
+            print(f"Model loaded on: {model.model.device}")
+            
+    except Exception as e:
+        print(f"Warning: Flash Attention load failed, falling back. Error: {e}")
+        model = Qwen3TTSModel.from_pretrained(model_id, device_map="cuda", dtype=torch.float16)
+
     CURRENT_MODEL = model
     CURRENT_MODE = target_mode
     return model

@@ -16,10 +16,10 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# --- 3. INSTALL FLASH ATTENTION (The Fix) ---
-# We limit the build to 4 parallel jobs to prevent running out of RAM (OOM Killed error).
-ENV MAX_JOBS=4
-RUN pip install flash-attn --no-build-isolation
+# Replace step 3 with this:
+# --- 3. INSTALL FLASH ATTENTION (Fast Method) ---
+# Instead of compiling (slow), we download the pre-built wheel for this specific CUDA/Torch version.
+RUN pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.6/flash_attn-2.5.6+cu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 
 # --- 4. COPY CODE ---
 COPY . .

@@ -10,13 +10,12 @@ import numpy as np
 from qwen_tts import Qwen3TTSModel
 import whisper_timestamped as whisper
 
-# --- ⚡ PERFORMANCE FIX 1: THREAD LIMITING ---
-# Prevent CPU from spawning 152 threads and choking the system
-# We limit this to 4 threads, which is optimal for most RunPod containers.
-os.environ["OMP_NUM_THREADS"] = "4"
-os.environ["MKL_NUM_THREADS"] = "4"
-torch.set_num_threads(4)
-torch.set_num_interop_threads(2)
+# --- ❌ REMOVED PERFORMANCE FIX 1: THREAD LIMITING ---
+# Limiting threads to 4 is fatal if the model falls back to CPU.
+# We want the CPU to run as fast as possible if it is needed.
+# os.environ["OMP_NUM_THREADS"] = "4" <--- DELETED
+# os.environ["MKL_NUM_THREADS"] = "4" <--- DELETED
+# torch.set_num_threads(4)            <--- DELETED
 
 # --- Configuration ---
 MODEL_IDS = {
@@ -45,15 +44,19 @@ def load_target_model(target_mode):
 
     print(f"--- 🚀 Loading {target_mode} on GPU... ---")
     try:
-        # --- ⚡ PERFORMANCE FIX 2: FLASH ATTENTION ---
-        # Force the model to use the GPU and fast attention kernels
+        # Load the model
         model = Qwen3TTSModel.from_pretrained(
             model_id, 
-            device_map="cuda", 
+            device_map="cuda",  # Attempt to map to GPU
             torch_dtype=torch.float16,
             attn_implementation="flash_attention_2"
         )
-        print("✅ Flash Attention 2 enabled.")
+        # --- ⚡ FIX 2: FORCE GPU ---
+        # Explicitly move the model to CUDA. This helps catch sub-modules 
+        # that device_map might miss.
+        model = model.cuda()
+        print("✅ Model loaded and forced to CUDA.")
+        
     except Exception as e:
         print(f"⚠️ Flash Attention load failed, falling back. Error: {e}")
         model = Qwen3TTSModel.from_pretrained(
@@ -61,7 +64,8 @@ def load_target_model(target_mode):
             device_map="cuda", 
             torch_dtype=torch.float16
         )
-        
+        model = model.cuda()
+
     CURRENT_MODEL = model
     CURRENT_MODE = target_mode
     return model
@@ -105,7 +109,12 @@ def handler(job):
         model = load_target_model(mode)
         wavs, sr = None, None
 
-        print(f"--- 🗣️ Generating audio (Threads: {torch.get_num_threads()})... ---")
+        print(f"--- 🗣️ Generating audio... ---")
+        
+        # NOTE: If the library re-initializes components during generation, 
+        # they might still default to CPU. Removing thread limits ensures 
+        # this fallback is at least fast (seconds instead of minutes).
+        
         if mode == "voice_design":
             instruct = job_input.get("instruct", "Clear voice.")
             wavs, sr = model.generate_voice_design(text=text, language=language, instruct=instruct)
@@ -123,7 +132,6 @@ def handler(job):
         if isinstance(raw_audio, np.ndarray):
             audio_tensor = torch.from_numpy(raw_audio).float()
         elif torch.is_tensor(raw_audio):
-            # Ensure tensor is moved to CPU before saving to avoid blocking GPU
             audio_tensor = raw_audio.detach().cpu().float()
         else:
             raise ValueError(f"Unexpected audio data type: {type(raw_audio)}")

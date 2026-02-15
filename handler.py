@@ -10,13 +10,6 @@ import numpy as np
 from qwen_tts import Qwen3TTSModel
 import whisper_timestamped as whisper
 
-# --- ❌ REMOVED PERFORMANCE FIX 1: THREAD LIMITING ---
-# Limiting threads to 4 is fatal if the model falls back to CPU.
-# We want the CPU to run as fast as possible if it is needed.
-# os.environ["OMP_NUM_THREADS"] = "4" <--- DELETED
-# os.environ["MKL_NUM_THREADS"] = "4" <--- DELETED
-# torch.set_num_threads(4)            <--- DELETED
-
 # --- Configuration ---
 MODEL_IDS = {
     "voice_design": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
@@ -27,6 +20,37 @@ MODEL_IDS = {
 CURRENT_MODEL = None
 CURRENT_MODE = None
 WHISPER_MODEL = None 
+
+def move_orphans_to_gpu(model_wrapper):
+    """
+    Scans the wrapper for lazily initialized components (like code_predictor)
+    that defaulted to CPU and forces them to GPU.
+    """
+    # List of sub-modules seen in your logs that initialize on CPU
+    orphan_names = ["code_predictor", "talker", "encoder", "decoder", "speaker_encoder"]
+    
+    print("--- 🕵️ Checking for CPU orphans... ---")
+    for name in orphan_names:
+        if hasattr(model_wrapper, name):
+            component = getattr(model_wrapper, name)
+            # Check if it has a .to() method (is a torch module)
+            if hasattr(component, "to"):
+                try:
+                    # Force move to CUDA
+                    component.to("cuda")
+                    print(f"✅ Moved orphan '{name}' to CUDA.")
+                except Exception as e:
+                    print(f"⚠️ Could not move '{name}': {e}")
+            else:
+                print(f"ℹ️ '{name}' exists but is not a torch module.")
+    
+    # Also try to move the underlying main model if accessible
+    if hasattr(model_wrapper, "model") and hasattr(model_wrapper.model, "to"):
+        try:
+             model_wrapper.model.to("cuda")
+             print("✅ Moved underlying 'model' to CUDA.")
+        except:
+             pass
 
 def load_target_model(target_mode):
     global CURRENT_MODEL, CURRENT_MODE
@@ -44,19 +68,13 @@ def load_target_model(target_mode):
 
     print(f"--- 🚀 Loading {target_mode} on GPU... ---")
     try:
-        # Load the model
         model = Qwen3TTSModel.from_pretrained(
             model_id, 
-            device_map="cuda",  # Attempt to map to GPU
+            device_map="cuda", 
             torch_dtype=torch.float16,
             attn_implementation="flash_attention_2"
         )
-        # --- ⚡ FIX 2: FORCE GPU ---
-        # Explicitly move the model to CUDA. This helps catch sub-modules 
-        # that device_map might miss.
-        model = model.cuda()
-        print("✅ Model loaded and forced to CUDA.")
-        
+        print("✅ Flash Attention 2 enabled.")
     except Exception as e:
         print(f"⚠️ Flash Attention load failed, falling back. Error: {e}")
         model = Qwen3TTSModel.from_pretrained(
@@ -64,8 +82,12 @@ def load_target_model(target_mode):
             device_map="cuda", 
             torch_dtype=torch.float16
         )
-        model = model.cuda()
 
+    # --- ⚡ FIX: MANUALLY MOVE ORPHANS ---
+    # We do not call model.cuda() (it crashes).
+    # Instead, we move the specific internal parts that stuck to CPU.
+    move_orphans_to_gpu(model)
+        
     CURRENT_MODEL = model
     CURRENT_MODE = target_mode
     return model
@@ -110,10 +132,6 @@ def handler(job):
         wavs, sr = None, None
 
         print(f"--- 🗣️ Generating audio... ---")
-        
-        # NOTE: If the library re-initializes components during generation, 
-        # they might still default to CPU. Removing thread limits ensures 
-        # this fallback is at least fast (seconds instead of minutes).
         
         if mode == "voice_design":
             instruct = job_input.get("instruct", "Clear voice.")

@@ -11,7 +11,6 @@ from qwen_tts import Qwen3TTSModel
 import whisper_timestamped as whisper
 
 # --- ⚡ THREAD LIMITING ---
-# Prevents CPU from spawning hundreds of threads and choking the system.
 os.environ["OMP_NUM_THREADS"] = "4"
 os.environ["MKL_NUM_THREADS"] = "4"
 torch.set_num_threads(4)
@@ -33,8 +32,6 @@ def load_target_model(target_mode):
     if CURRENT_MODE == target_mode and CURRENT_MODEL is not None:
         return CURRENT_MODEL
 
-    # Only unload when switching between TTS variants.
-    # ✅ FIX: We no longer unload TTS to load Whisper — both stay in VRAM.
     if CURRENT_MODEL is not None:
         del CURRENT_MODEL
         CURRENT_MODEL = None
@@ -47,24 +44,25 @@ def load_target_model(target_mode):
 
     print(f"--- 🚀 Loading {target_mode} on GPU... ---")
     try:
-        # ✅ FIX: Use `dtype` instead of `torch_dtype`.
-        # The Qwen3 TTS library deprecated `torch_dtype` — passing it was
-        # silently ignored, causing the model to load as float32 instead of
-        # float16. This doubled memory usage and slowed generation significantly.
+        # ✅ KEY FIX: Do NOT pass dtype/torch_dtype kwargs to from_pretrained.
+        # Qwen3TTSModel contains multiple internal sub-models (talker,
+        # code_predictor, speaker_encoder, vocoder). The dtype kwarg only
+        # reaches the top-level HuggingFace wrapper — the sub-models silently
+        # stay in float32, which causes ~90s LLM inference instead of ~5s.
+        #
+        # The correct approach is to load first, then call .half().cuda()
+        # which recursively converts EVERY parameter tensor in EVERY sub-model
+        # to float16 on GPU — no sub-model left behind.
         model = Qwen3TTSModel.from_pretrained(
             model_id,
-            device_map="cuda",
-            dtype=torch.float16,
             attn_implementation="flash_attention_2"
         )
-        print("✅ Flash Attention 2 enabled.")
+        model = model.half().cuda()
+        print("✅ Flash Attention 2 enabled, model in float16 on GPU.")
     except Exception as e:
         print(f"⚠️ Flash Attention load failed, falling back. Error: {e}")
-        model = Qwen3TTSModel.from_pretrained(
-            model_id,
-            device_map="cuda",
-            dtype=torch.float16
-        )
+        model = Qwen3TTSModel.from_pretrained(model_id)
+        model = model.half().cuda()
 
     CURRENT_MODEL = model
     CURRENT_MODE = target_mode
@@ -73,18 +71,15 @@ def load_target_model(target_mode):
 def get_whisper_model():
     global WHISPER_MODEL
     if WHISPER_MODEL is None:
-        # ✅ FIX: Whisper is loaded once and kept in VRAM alongside the TTS model.
-        # Previously, switching to transcription mode unloaded TTS, then the next
-        # TTS request had to reload it — causing a 60-second cold-reload delay.
-        # Whisper base is only ~150MB; both models fit comfortably in GPU VRAM.
+        # Whisper stays resident in VRAM alongside TTS — only ~150MB.
+        # Keeps both models warm so no reload is needed between requests.
         print("--- 🎙️ Loading Whisper (stays resident in VRAM) ---")
         WHISPER_MODEL = whisper.load_model("base", device="cuda")
     return WHISPER_MODEL
 
-# --- ✅ FIX: PRELOAD AT STARTUP ---
-# Load the default TTS model and Whisper before any requests arrive.
-# This eliminates the 60-second first-request cold start entirely.
-# RunPod serverless runs this module-level code once when the worker starts.
+# --- ✅ PRELOAD AT STARTUP ---
+# Both models are loaded before RunPod starts polling for jobs.
+# This eliminates cold-start delay on the first request.
 print("--- 🔥 Preloading voice_design model at startup... ---")
 load_target_model("voice_design")
 print("--- 🔥 Preloading Whisper model at startup... ---")
@@ -125,7 +120,7 @@ def handler(job):
         model = load_target_model(mode)
         wavs, sr = None, None
 
-        print(f"--- 🗣️ Generating audio (Threads: {torch.get_num_threads()})... ---")
+        print(f"--- 🗣️ Generating audio (mode={mode}, threads={torch.get_num_threads()})... ---")
         if mode == "voice_design":
             instruct = job_input.get("instruct", "Clear voice.")
             wavs, sr = model.generate_voice_design(text=text, language=language, instruct=instruct)

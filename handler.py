@@ -6,13 +6,12 @@ import base64
 import gc
 import os
 import tempfile
-import numpy as np 
+import numpy as np
 from qwen_tts import Qwen3TTSModel
 import whisper_timestamped as whisper
 
-# --- ⚡ PERFORMANCE FIX 1: THREAD LIMITING ---
-# Prevent CPU from spawning 152 threads and choking the system
-# We limit this to 4 threads, which is optimal for most RunPod containers.
+# --- ⚡ THREAD LIMITING ---
+# Prevents CPU from spawning hundreds of threads and choking the system.
 os.environ["OMP_NUM_THREADS"] = "4"
 os.environ["MKL_NUM_THREADS"] = "4"
 torch.set_num_threads(4)
@@ -27,13 +26,15 @@ MODEL_IDS = {
 
 CURRENT_MODEL = None
 CURRENT_MODE = None
-WHISPER_MODEL = None 
+WHISPER_MODEL = None
 
 def load_target_model(target_mode):
     global CURRENT_MODEL, CURRENT_MODE
     if CURRENT_MODE == target_mode and CURRENT_MODEL is not None:
         return CURRENT_MODEL
 
+    # Only unload when switching between TTS variants.
+    # ✅ FIX: We no longer unload TTS to load Whisper — both stay in VRAM.
     if CURRENT_MODEL is not None:
         del CURRENT_MODEL
         CURRENT_MODEL = None
@@ -41,27 +42,30 @@ def load_target_model(target_mode):
         torch.cuda.empty_cache()
 
     model_id = MODEL_IDS.get(target_mode)
-    if not model_id: raise ValueError(f"Invalid mode: {target_mode}")
+    if not model_id:
+        raise ValueError(f"Invalid mode: {target_mode}")
 
     print(f"--- 🚀 Loading {target_mode} on GPU... ---")
     try:
-        # --- ⚡ PERFORMANCE FIX 2: FLASH ATTENTION ---
-        # Force the model to use the GPU and fast attention kernels
+        # ✅ FIX: Use `dtype` instead of `torch_dtype`.
+        # The Qwen3 TTS library deprecated `torch_dtype` — passing it was
+        # silently ignored, causing the model to load as float32 instead of
+        # float16. This doubled memory usage and slowed generation significantly.
         model = Qwen3TTSModel.from_pretrained(
-            model_id, 
-            device_map="cuda", 
-            torch_dtype=torch.float16,
+            model_id,
+            device_map="cuda",
+            dtype=torch.float16,
             attn_implementation="flash_attention_2"
         )
         print("✅ Flash Attention 2 enabled.")
     except Exception as e:
         print(f"⚠️ Flash Attention load failed, falling back. Error: {e}")
         model = Qwen3TTSModel.from_pretrained(
-            model_id, 
-            device_map="cuda", 
-            torch_dtype=torch.float16
+            model_id,
+            device_map="cuda",
+            dtype=torch.float16
         )
-        
+
     CURRENT_MODEL = model
     CURRENT_MODE = target_mode
     return model
@@ -69,9 +73,23 @@ def load_target_model(target_mode):
 def get_whisper_model():
     global WHISPER_MODEL
     if WHISPER_MODEL is None:
-        print("--- 🎙️ Loading Whisper ---")
+        # ✅ FIX: Whisper is loaded once and kept in VRAM alongside the TTS model.
+        # Previously, switching to transcription mode unloaded TTS, then the next
+        # TTS request had to reload it — causing a 60-second cold-reload delay.
+        # Whisper base is only ~150MB; both models fit comfortably in GPU VRAM.
+        print("--- 🎙️ Loading Whisper (stays resident in VRAM) ---")
         WHISPER_MODEL = whisper.load_model("base", device="cuda")
     return WHISPER_MODEL
+
+# --- ✅ FIX: PRELOAD AT STARTUP ---
+# Load the default TTS model and Whisper before any requests arrive.
+# This eliminates the 60-second first-request cold start entirely.
+# RunPod serverless runs this module-level code once when the worker starts.
+print("--- 🔥 Preloading voice_design model at startup... ---")
+load_target_model("voice_design")
+print("--- 🔥 Preloading Whisper model at startup... ---")
+get_whisper_model()
+print("--- ✅ All models warm and ready. ---")
 
 def handler(job):
     job_input = job["input"]
@@ -81,8 +99,9 @@ def handler(job):
     if mode == "transcribe":
         try:
             audio_b64 = job_input.get("audio_base64")
-            if not audio_b64: return {"error": "No audio_base64 provided"}
-            
+            if not audio_b64:
+                return {"error": "No audio_base64 provided"}
+
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp.write(base64.b64decode(audio_b64))
                 tmp_path = tmp.name
@@ -90,7 +109,7 @@ def handler(job):
             model = get_whisper_model()
             audio = whisper.load_audio(tmp_path)
             result = whisper.transcribe(model, audio, language="en")
-            
+
             os.remove(tmp_path)
             return {"status": "success", "transcription": result}
         except Exception as e:
@@ -99,7 +118,8 @@ def handler(job):
     # --- TTS GENERATION ---
     text = job_input.get("text")
     language = job_input.get("language", "English")
-    if not text: return {"error": "No text provided."}
+    if not text:
+        return {"error": "No text provided."}
 
     try:
         model = load_target_model(mode)
@@ -123,17 +143,16 @@ def handler(job):
         if isinstance(raw_audio, np.ndarray):
             audio_tensor = torch.from_numpy(raw_audio).float()
         elif torch.is_tensor(raw_audio):
-            # Ensure tensor is moved to CPU before saving to avoid blocking GPU
             audio_tensor = raw_audio.detach().cpu().float()
         else:
             raise ValueError(f"Unexpected audio data type: {type(raw_audio)}")
-        
+
         if audio_tensor.dim() == 1:
             audio_tensor = audio_tensor.unsqueeze(0)
 
         byte_io = io.BytesIO()
         torchaudio.save(byte_io, audio_tensor, sr, format="wav")
-        
+
         return {
             "status": "success",
             "audio_base64": base64.b64encode(byte_io.getvalue()).decode('utf-8')

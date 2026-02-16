@@ -1,11 +1,13 @@
 runpod
-torch
-torchaudio
+# ✅ DO NOT list torch or torchaudio here.
+# The base image (runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel) already ships
+# CUDA-enabled torch 2.2.0. Reinstalling via plain `pip install torch` would
+# pull the CPU-only wheel from PyPI and overwrite it, causing 100% CPU / ~28% GPU.
 transformers
 accelerate
 scipy
 numpy<2.0
 openai-whisper
 whisper-timestamped
-# We keep the GitHub version of Qwen
+# Qwen TTS from GitHub
 git+https://github.com/QwenLM/Qwen3-TTS.git

@@ -10,6 +10,14 @@ import numpy as np
 from qwen_tts import Qwen3TTSModel
 import whisper_timestamped as whisper
 
+# --- ⚡ PERFORMANCE FIX 1: THREAD LIMITING ---
+# Prevent CPU from spawning 152 threads and choking the system
+# We limit this to 4 threads, which is optimal for most RunPod containers.
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+torch.set_num_threads(4)
+torch.set_num_interop_threads(2)
+
 # --- Configuration ---
 MODEL_IDS = {
     "voice_design": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
@@ -20,37 +28,6 @@ MODEL_IDS = {
 CURRENT_MODEL = None
 CURRENT_MODE = None
 WHISPER_MODEL = None 
-
-def move_orphans_to_gpu(model_wrapper):
-    """
-    Scans the wrapper for lazily initialized components (like code_predictor)
-    that defaulted to CPU and forces them to GPU.
-    """
-    # List of sub-modules seen in your logs that initialize on CPU
-    orphan_names = ["code_predictor", "talker", "encoder", "decoder", "speaker_encoder"]
-    
-    print("--- 🕵️ Checking for CPU orphans... ---")
-    for name in orphan_names:
-        if hasattr(model_wrapper, name):
-            component = getattr(model_wrapper, name)
-            # Check if it has a .to() method (is a torch module)
-            if hasattr(component, "to"):
-                try:
-                    # Force move to CUDA
-                    component.to("cuda")
-                    print(f"✅ Moved orphan '{name}' to CUDA.")
-                except Exception as e:
-                    print(f"⚠️ Could not move '{name}': {e}")
-            else:
-                print(f"ℹ️ '{name}' exists but is not a torch module.")
-    
-    # Also try to move the underlying main model if accessible
-    if hasattr(model_wrapper, "model") and hasattr(model_wrapper.model, "to"):
-        try:
-             model_wrapper.model.to("cuda")
-             print("✅ Moved underlying 'model' to CUDA.")
-        except:
-             pass
 
 def load_target_model(target_mode):
     global CURRENT_MODEL, CURRENT_MODE
@@ -68,6 +45,8 @@ def load_target_model(target_mode):
 
     print(f"--- 🚀 Loading {target_mode} on GPU... ---")
     try:
+        # --- ⚡ PERFORMANCE FIX 2: FLASH ATTENTION ---
+        # Force the model to use the GPU and fast attention kernels
         model = Qwen3TTSModel.from_pretrained(
             model_id, 
             device_map="cuda", 
@@ -82,11 +61,6 @@ def load_target_model(target_mode):
             device_map="cuda", 
             torch_dtype=torch.float16
         )
-
-    # --- ⚡ FIX: MANUALLY MOVE ORPHANS ---
-    # We do not call model.cuda() (it crashes).
-    # Instead, we move the specific internal parts that stuck to CPU.
-    move_orphans_to_gpu(model)
         
     CURRENT_MODEL = model
     CURRENT_MODE = target_mode
@@ -131,8 +105,7 @@ def handler(job):
         model = load_target_model(mode)
         wavs, sr = None, None
 
-        print(f"--- 🗣️ Generating audio... ---")
-        
+        print(f"--- 🗣️ Generating audio (Threads: {torch.get_num_threads()})... ---")
         if mode == "voice_design":
             instruct = job_input.get("instruct", "Clear voice.")
             wavs, sr = model.generate_voice_design(text=text, language=language, instruct=instruct)
@@ -150,6 +123,7 @@ def handler(job):
         if isinstance(raw_audio, np.ndarray):
             audio_tensor = torch.from_numpy(raw_audio).float()
         elif torch.is_tensor(raw_audio):
+            # Ensure tensor is moved to CPU before saving to avoid blocking GPU
             audio_tensor = raw_audio.detach().cpu().float()
         else:
             raise ValueError(f"Unexpected audio data type: {type(raw_audio)}")

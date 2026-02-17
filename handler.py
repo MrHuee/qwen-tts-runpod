@@ -7,14 +7,22 @@ import gc
 import os
 import tempfile
 import numpy as np
+import time
+import warnings
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ⚡ THREAD / ENV TUNING  (GPU-bound workload → keep CPU threads low)
+# ⚡ THREAD / ENV TUNING
 # ──────────────────────────────────────────────────────────────────────────────
-os.environ.setdefault("OMP_NUM_THREADS", "2")
-os.environ.setdefault("MKL_NUM_THREADS", "2")
-torch.set_num_threads(2)
-torch.set_num_interop_threads(2)
+# Reduce OpenMP/MKL threads to avoid CPU contention.
+# Since we are GPU-bound, 1-2 threads is optimal for data loading/preprocessing.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
+# Suppress warnings to keep logs clean
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -34,15 +42,12 @@ WHISPER_MODEL = None
 # Model helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_tts(model_id, use_flash=True):
-    """Load a Qwen3-TTS model with optional Flash Attention 2.
-
-    CRITICAL: We pass BOTH `dtype` (for the Qwen wrapper) AND `torch_dtype`
-    (for HuggingFace's AutoModel.from_pretrained internals). Without
-    `torch_dtype`, HuggingFace loads in float32 and Flash Attention silently
-    falls back → model runs on CPU → 100% CPU, 16% GPU, 60-80s per request.
-    """
+    """Load a Qwen3-TTS model with improved device consistency checks."""
     from qwen_tts import Qwen3TTSModel
 
+    print(f"--- 🛠️ Loading {model_id} (Flash={use_flash}) ---")
+    
+    # Pass both dtype args to satisfy Qwen wrapper AND HuggingFace internals
     kwargs = dict(
         device_map="cuda:0",
         dtype=torch.bfloat16,
@@ -51,15 +56,39 @@ def _load_tts(model_id, use_flash=True):
     if use_flash:
         kwargs["attn_implementation"] = "flash_attention_2"
 
+    t_start = time.time()
     model = Qwen3TTSModel.from_pretrained(model_id, **kwargs)
+    print(f"   ⏱️ Model load took {time.time() - t_start:.2f}s")
 
-    # Diagnostic: verify the internal HF model is actually on GPU in bfloat16
-    inner = model.model  # Qwen3TTSForConditionalGeneration
+    # 🔍 DEEP INSPECTION: extensive check of where submodules are living
     try:
-        p = next(inner.parameters())
-        print(f"   📊 Model dtype = {p.dtype}, device = {p.device}")
-    except StopIteration:
-        pass
+        inner = model.model  # Qwen3TTSForConditionalGeneration
+        first_param = next(inner.parameters())
+        print(f"   📊 Main Model: dtype={first_param.dtype}, device={first_param.device}")
+
+        # Check critical subcomponents
+        components = ["code_predictor", "speech_tokenizer", "talker"]
+        for name in components:
+            if hasattr(inner, name):
+                mod = getattr(inner, name)
+                # Some submodules might be wrapped or just config
+                if hasattr(mod, "parameters"):
+                    try:
+                        p = next(mod.parameters())
+                        print(f"   🔍 {name}: device={p.device}, dtype={p.dtype}")
+                        # Force move if on CPU
+                        if p.device.type == "cpu":
+                            print(f"   ⚠️ {name} is on CPU! Moving to cuda:0...")
+                            mod.to("cuda:0")
+                    except StopIteration:
+                        print(f"   ⚠️ {name} has no parameters?")
+                else:
+                    print(f"   ℹ️ {name} found but no parameters (might be config/helper).")
+            else:
+                print(f"   ❓ {name} not found in model.")
+
+    except Exception as e:
+        print(f"   ⚠️ Failed to inspect model internals: {e}")
 
     return model
 
@@ -68,12 +97,11 @@ def load_target_model(target_mode):
     """Load the requested TTS model onto GPU. Caches across calls."""
     global CURRENT_MODEL, CURRENT_MODE
 
-    # Already loaded → return immediately
     if CURRENT_MODE == target_mode and CURRENT_MODEL is not None:
         return CURRENT_MODEL
 
-    # Unload previous model
     if CURRENT_MODEL is not None:
+        print("--- ♻️ Unloading previous model ---")
         del CURRENT_MODEL
         CURRENT_MODEL = None
         gc.collect()
@@ -81,11 +109,7 @@ def load_target_model(target_mode):
 
     model_id = MODEL_IDS.get(target_mode)
     if not model_id:
-        raise ValueError(
-            f"Invalid mode: '{target_mode}'. Must be one of: {list(MODEL_IDS.keys())}"
-        )
-
-    print(f"--- 🚀 Loading {target_mode} ({model_id}) ---")
+        raise ValueError(f"Invalid mode: '{target_mode}'.")
 
     try:
         model = _load_tts(model_id, use_flash=True)
@@ -101,56 +125,49 @@ def load_target_model(target_mode):
 
 
 def get_whisper_model():
-    """Return the cached Whisper model, loading on first call."""
     global WHISPER_MODEL
     if WHISPER_MODEL is None:
         import whisper_timestamped as whisper
-
         print("--- 🎙️ Loading Whisper base on GPU ---")
+        t0 = time.time()
         WHISPER_MODEL = whisper.load_model("base", device="cuda")
-        print("✅ Whisper ready")
+        print(f"✅ Whisper ready ({time.time() - t0:.2f}s)")
     return WHISPER_MODEL
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 🔥 STARTUP PRELOAD
-#
-# Preload the default TTS model + Whisper at import time so that the first
-# real request hits a warm worker.  Wrapped in try/except so a failure here
-# still lets the worker start (lazy fallback on first request).
 # ──────────────────────────────────────────────────────────────────────────────
 print("--- 🔥 Preloading models at startup... ---")
-
 try:
     load_target_model("voice_design")
-    # CUDA warmup — run a tiny forward pass to JIT-compile kernels
+    # Warmup
     print("--- ⏱️ CUDA warmup (voice_design) ---")
+    t0 = time.time()
     with torch.inference_mode():
-        _warm_wavs, _warm_sr = CURRENT_MODEL.generate_voice_design(
-            text="Hi.",
-            language="English",
-            instruct="Clear voice.",
+        _ = CURRENT_MODEL.generate_voice_design(
+            text="Hi.", language="English", instruct="Verify device placement."
         )
-    del _warm_wavs, _warm_sr
-    torch.cuda.empty_cache()
-    print("✅ Warmup done")
+    torch.cuda.synchronize()
+    print(f"✅ Warmup done in {time.time() - t0:.2f}s")
 except Exception as e:
-    import traceback
-    traceback.print_exc()
-    print(f"⚠️ Startup preload/warmup failed ({e}); will load lazily.")
+    print(f"⚠️ Startup preload/warmup failed: {e}")
 
 try:
     get_whisper_model()
 except Exception as e:
-    print(f"⚠️ Whisper preload failed ({e}); will load lazily.")
+    print(f"⚠️ Whisper preload failed: {e}")
 
-print("--- ✅ Startup preload complete ---")
+print("--- ✅ Startup Complete ---")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Request handler
 # ──────────────────────────────────────────────────────────────────────────────
 def handler(job):
+    t_handler_start = time.time()
+    print(f"--- 🏁 Handler started at {t_handler_start} ---")
+
     try:
         job_input = job.get("input", {})
         mode = job_input.get("mode", "voice_design").lower()
@@ -159,19 +176,20 @@ def handler(job):
         if mode == "transcribe":
             audio_b64 = job_input.get("audio_base64")
             if not audio_b64:
-                return {"error": "No audio_base64 provided for transcription."}
+                return {"error": "No audio_base64 provided."}
 
             import whisper_timestamped as whisper
-
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp.write(base64.b64decode(audio_b64))
                 tmp_path = tmp.name
 
             try:
+                t_trans = time.time()
                 wmodel = get_whisper_model()
                 audio = whisper.load_audio(tmp_path)
                 with torch.inference_mode():
                     result = whisper.transcribe(wmodel, audio, language="en")
+                print(f"⏱️ Transcription took {time.time() - t_trans:.2f}s")
                 return {"status": "success", "transcription": result}
             finally:
                 if os.path.exists(tmp_path):
@@ -179,44 +197,45 @@ def handler(job):
 
         # ── TTS GENERATION ───────────────────────────────────────────────
         if mode not in MODEL_IDS:
-            return {
-                "error": f"Unknown mode '{mode}'. Valid: {list(MODEL_IDS.keys()) + ['transcribe']}"
-            }
+            return {"error": f"Unknown mode '{mode}'."}
 
         text = job_input.get("text")
         if not text:
-            return {"error": "No 'text' provided."}
+            return {"error": "No text provided."}
 
-        language = job_input.get("language", "English")
+        # Timer: Model Load
+        t_load = time.time()
         model = load_target_model(mode)
+        print(f"⏱️ Model access (cached/load) took {time.time() - t_load:.2f}s")
 
         print(f"--- 🗣️ Generating audio (mode={mode}) ---")
+        t_gen_start = time.time()
 
         with torch.inference_mode():
             if mode == "voice_design":
                 instruct = job_input.get("instruct", "Clear voice.")
                 wavs, sr = model.generate_voice_design(
-                    text=text, language=language, instruct=instruct,
+                    text=text, language=job_input.get("language", "English"), instruct=instruct,
                 )
             elif mode == "custom_voice":
                 speaker = job_input.get("speaker", "Anna")
                 wavs, sr = model.generate_custom_voice(
-                    text=text, language=language, speaker=speaker,
+                    text=text, language=job_input.get("language", "English"), speaker=speaker,
                 )
             elif mode == "voice_clone":
                 ref_audio = job_input.get("ref_audio")
                 ref_text = job_input.get("ref_text")
-                if not ref_audio or not ref_text:
-                    return {"error": "voice_clone requires 'ref_audio' and 'ref_text'."}
                 wavs, sr = model.generate_voice_clone(
-                    text=text, language=language,
+                    text=text, language=job_input.get("language", "English"),
                     ref_audio=ref_audio, ref_text=ref_text,
                 )
 
-        # Wait for GPU to finish before encoding
         torch.cuda.synchronize()
+        t_gen_end = time.time()
+        print(f"⏱️ Generation (inference + sync) took {t_gen_end - t_gen_start:.2f}s")
 
-        # ── Encode audio to base64 WAV ───────────────────────────────────
+        # ── Encoding ─────────────────────────────────────────────────────
+        t_enc_start = time.time()
         raw_audio = wavs[0]
         if isinstance(raw_audio, np.ndarray):
             audio_tensor = torch.from_numpy(raw_audio).float()
@@ -230,19 +249,24 @@ def handler(job):
 
         byte_io = io.BytesIO()
         torchaudio.save(byte_io, audio_tensor, sr, format="wav")
+        print(f"⏱️ Encoding took {time.time() - t_enc_start:.2f}s")
 
-        print("✅ Audio generated successfully.")
+        t_total = time.time() - t_handler_start
+        print(f"✅ Handler complete in {t_total:.2f}s")
+
         return {
             "status": "success",
             "audio_base64": base64.b64encode(byte_io.getvalue()).decode("utf-8"),
+            "stats": {
+                "generation_time": f"{t_gen_end - t_gen_start:.2f}s",
+                "total_time": f"{t_total:.2f}s"
+            }
         }
 
     except Exception as e:
         import traceback
-
         err = traceback.format_exc()
         print(f"❌ Handler error:\n{err}")
         return {"error": str(e), "traceback": err}
-
 
 runpod.serverless.start({"handler": handler})

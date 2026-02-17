@@ -16,19 +16,25 @@ COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# --- 3. INSTALL FLASH ATTENTION (Fast Method) ---
-# The cu122 pre-built wheel is used here. Although the base image is CUDA 12.1.1,
-# CUDA is backwards compatible so cu122 wheels run correctly on cu121 runtimes.
-# A cu121-specific wheel does not exist for this flash-attention release.
+# --- 3. INSTALL FLASH ATTENTION (pre-built wheel — fast) ---
+# cu122 wheel is used here; CUDA 12.1 runtime is backwards-compatible with it.
 RUN pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.6/flash_attn-2.5.6+cu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 
 # --- 4. COPY CODE ---
 COPY . .
 
-# --- 5. CACHE MODELS ---
-# Models are baked into the image so the server starts without downloading.
+# --- 5. CACHE MODELS AT BUILD TIME ---
+# Bakes weights into the image so workers start without downloading.
 RUN python3 download_models.py && rm download_models.py
 
-# --- 6. START ---
-ENV OMP_NUM_THREADS=4
+# --- 6. RUNTIME ENVIRONMENT ---
+# Keep CPU threads low — they don't help GPU work and compete with CUDA streams.
+ENV OMP_NUM_THREADS=2
+ENV MKL_NUM_THREADS=2
+# Avoid CUDA device re-init overhead across fork/spawn boundaries
+ENV CUDA_LAUNCH_BLOCKING=0
+# Let cuDNN auto-select the fastest algorithms for fixed-size conv inputs (vocoder)
+ENV CUDNN_BENCHMARK=1
+
+# --- 7. START ---
 CMD [ "python3", "-u", "handler.py" ]

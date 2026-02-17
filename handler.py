@@ -18,6 +18,10 @@ os.environ["MKL_NUM_THREADS"] = "1"
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
+# Enable TF32 for potential speedup on Ampere+ GPUs (like A40)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -49,7 +53,11 @@ def _load_tts(model_id, use_flash=True):
     model = Qwen3TTSModel.from_pretrained(model_id, **kwargs)
     print(f"   ⏱️ Model load took {time.time() - t_start:.2f}s")
     
-    # Just verify main device
+    # 🩹 FIX: Explicitly set config dtype to silence warnings / ensure behavior
+    if hasattr(model, "model") and hasattr(model.model, "config"):
+        model.model.config.torch_dtype = torch.bfloat16
+        print("   🔧 Enforced config.torch_dtype = bfloat16")
+
     try:
         p = next(model.model.parameters())
         print(f"   📊 Model: dtype={p.dtype}, device={p.device}")
@@ -70,7 +78,6 @@ def load_target_model(target_mode):
         torch.cuda.empty_cache()
 
     model_id = MODEL_IDS.get(target_mode)
-    if not model_id: raise ValueError(f"Invalid mode: '{target_mode}'")
 
     try:
         model = _load_tts(model_id, use_flash=True)
@@ -100,15 +107,13 @@ def get_whisper_model():
 print("--- 🔥 Preloading models... ---")
 try:
     load_target_model("voice_design")
-    # Warmup with explicit max tokens to test
     print("--- ⏱️ CUDA warmup ---")
     t0 = time.time()
     with torch.inference_mode():
+        # Pass use_cache=True explicitly
         _ = CURRENT_MODEL.generate_voice_design(
-            text="Hi.", 
-            language="English", 
-            instruct="Warmup.",
-            max_new_tokens=50 # Force short warmup
+            text="Hi.", language="English", instruct="Warmup.",
+            max_new_tokens=50, use_cache=True
         )
     torch.cuda.synchronize()
     print(f"✅ Warmup done in {time.time() - t0:.2f}s")
@@ -144,7 +149,6 @@ def handler(job):
                 audio = whisper.load_audio(tmp_path)
                 with torch.inference_mode():
                     result = whisper.transcribe(wmodel, audio, language="en")
-                print(f"⏱️ Transcription took {time.time() - t_trans:.2f}s")
                 return {"status": "success", "transcription": result}
             finally:
                 if os.path.exists(tmp_path): os.remove(tmp_path)
@@ -154,53 +158,44 @@ def handler(job):
         text = job_input.get("text", "")
         if not text: return {"error": "No text."}
 
-        # Dynamic max_new_tokens to prevent runaway generation (EOS failure)
-        # 12Hz model = 12 tokens/sec. 
-        # Safety margin: allow 1 second per character + 5s buffer worth of tokens
-        # 1 char ~ 12 tokens? No, that's excessive. 
-        # Let's simple cap at a reasonable large limit, or user provided.
-        # Default to 1024 (85 seconds of audio) if not specified.
-        user_max_tokens = job_input.get("max_new_tokens")
-        if user_max_tokens:
-            max_tokens = int(user_max_tokens)
-        else:
-            # Conservative auto-limit: 
-            # 12 tokens/sec * (len(text)*0.3 + 5 sec) ?
-            # Let's just use a hard safety cap of 1536 (approx 2 mins) 
-            # OR better: 512 (42s) for typical usage to prove speed fix.
-            max_tokens = 1024 
+        # Dynamic max_new_tokens (default 1024 ~85s)
+        # Explicitly enabling use_cache for speed
+        user_max = job_input.get("max_new_tokens")
+        max_tokens = int(user_max) if user_max else 1024
 
         model = load_target_model(mode)
         
-        print(f"--- 🗣️ Generating ({mode}) | Len: {len(text)} | MaxTokens: {max_tokens} ---")
+        print(f"--- 🗣️ GEN: {mode} | Len:{len(text)} | Max:{max_tokens} | Cache:True ---")
         t_gen = time.time()
         
         with torch.inference_mode():
+            # Common kwargs for speed
+            gen_args = dict(
+                text=text, 
+                language=job_input.get("language", "English"),
+                max_new_tokens=max_tokens,
+                use_cache=True,  # 🚀 CRITICAL FOR SPEED
+            )
+
             if mode == "voice_design":
-                wavs, sr = model.generate_voice_design(
-                    text=text, 
-                    language=job_input.get("language", "English"),
-                    instruct=job_input.get("instruct", "Clear voice."),
-                    max_new_tokens=max_tokens
-                )
+                gen_args["instruct"] = job_input.get("instruct", "Clear voice.")
+                wavs, sr = model.generate_voice_design(**gen_args)
             elif mode == "custom_voice":
-                wavs, sr = model.generate_custom_voice(
-                    text=text,
-                    language=job_input.get("language", "English"),
-                    speaker=job_input.get("speaker", "Anna"),
-                    max_new_tokens=max_tokens
-                )
+                gen_args["speaker"] = job_input.get("speaker", "Anna")
+                wavs, sr = model.generate_custom_voice(**gen_args)
             elif mode == "voice_clone":
-                wavs, sr = model.generate_voice_clone(
-                    text=text,
-                    language=job_input.get("language", "English"),
-                    ref_audio=job_input.get("ref_audio"),
-                    ref_text=job_input.get("ref_text"),
-                    max_new_tokens=max_tokens
-                )
+                gen_args["ref_audio"] = job_input.get("ref_audio")
+                gen_args["ref_text"] = job_input.get("ref_text")
+                wavs, sr = model.generate_voice_clone(**gen_args)
 
         torch.cuda.synchronize()
         dt_gen = time.time() - t_gen
+        
+        # Calculate Tokens/Sec heuristic (approx)
+        # Using 12Hz as frame rate
+        # 45s audio = 540 frames. 
+        # But we don't know exact frames generated without inspecting output.
+        # Just log time.
         print(f"⏱️ Generation took {dt_gen:.2f}s")
 
         # Encode
@@ -217,7 +212,7 @@ def handler(job):
         audio_b64 = base64.b64encode(byte_io.getvalue()).decode("utf-8")
 
         dt_total = time.time() - t_start
-        print(f"✅ Complete in {dt_total:.2f}s")
+        print(f"✅ Complete in {dt_total:.2f}s (Gen: {dt_gen:.2f}s)")
         return {
             "status": "success", 
             "audio_base64": audio_b64,

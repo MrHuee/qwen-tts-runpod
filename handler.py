@@ -78,7 +78,6 @@ def load_target_model(target_mode):
         model = _load_tts(model_id, use_flash=False)
         print("✅ Loaded: bfloat16 + standard attention")
 
-    model.eval()
     CURRENT_MODEL = model
     CURRENT_MODE = target_mode
     return model

@@ -11,7 +11,7 @@ import whisper_timestamped as whisper
 def download(name, model_id):
     print(f"--- ⬇️ Downloading {name} ---")
     try:
-        Qwen3TTSModel.from_pretrained(model_id, dtype=torch.bfloat16)
+        Qwen3TTSModel.from_pretrained(model_id, dtype=torch.bfloat16, torch_dtype=torch.bfloat16)
         print(f"✅ {name} cached.")
     except Exception as e:
         print(f"❌ Failed to download {name}: {e}")

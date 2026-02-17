@@ -34,17 +34,34 @@ WHISPER_MODEL = None
 # Model helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_tts(model_id, use_flash=True):
-    """Load a Qwen3-TTS model with optional Flash Attention 2."""
+    """Load a Qwen3-TTS model with optional Flash Attention 2.
+
+    CRITICAL: We pass BOTH `dtype` (for the Qwen wrapper) AND `torch_dtype`
+    (for HuggingFace's AutoModel.from_pretrained internals). Without
+    `torch_dtype`, HuggingFace loads in float32 and Flash Attention silently
+    falls back → model runs on CPU → 100% CPU, 16% GPU, 60-80s per request.
+    """
     from qwen_tts import Qwen3TTSModel
 
     kwargs = dict(
         device_map="cuda:0",
         dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
     )
     if use_flash:
         kwargs["attn_implementation"] = "flash_attention_2"
 
-    return Qwen3TTSModel.from_pretrained(model_id, **kwargs)
+    model = Qwen3TTSModel.from_pretrained(model_id, **kwargs)
+
+    # Diagnostic: verify the internal HF model is actually on GPU in bfloat16
+    inner = model.model  # Qwen3TTSForConditionalGeneration
+    try:
+        p = next(inner.parameters())
+        print(f"   📊 Model dtype = {p.dtype}, device = {p.device}")
+    except StopIteration:
+        pass
+
+    return model
 
 
 def load_target_model(target_mode):
@@ -118,6 +135,8 @@ try:
     torch.cuda.empty_cache()
     print("✅ Warmup done")
 except Exception as e:
+    import traceback
+    traceback.print_exc()
     print(f"⚠️ Startup preload/warmup failed ({e}); will load lazily.")
 
 try:

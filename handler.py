@@ -132,11 +132,40 @@ print("--- ✅ Startup Complete ---")
 # ──────────────────────────────────────────────────────────────────────────────
 # Audio download helper (for voice cloning from URLs)
 # ──────────────────────────────────────────────────────────────────────────────
+import subprocess
+
+def _gdrive_download(file_id):
+    """Download from Google Drive, handling the virus-scan confirmation page."""
+    session = requests.Session()
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    resp = session.get(url, timeout=60, allow_redirects=True)
+    resp.raise_for_status()
+
+    # Check if we got the confirmation page (large files / virus scan)
+    # Google returns HTML with a confirm token we need to accept
+    if b"</html>" in resp.content[:5000].lower() or b"confirm" in resp.content[:5000].lower():
+        # Try to extract the confirm token
+        import re as _re
+        confirm_match = _re.search(r'confirm=([0-9A-Za-z_-]+)', resp.text)
+        if confirm_match:
+            confirm_token = confirm_match.group(1)
+            print(f"   🔑 Got GDrive confirm token, retrying...")
+            resp = session.get(url + f"&confirm={confirm_token}", timeout=60, allow_redirects=True)
+            resp.raise_for_status()
+        else:
+            # Try with confirm=t (common workaround)
+            print(f"   🔑 Trying GDrive confirm=t workaround...")
+            resp = session.get(url + "&confirm=t", timeout=60, allow_redirects=True)
+            resp.raise_for_status()
+
+    return resp
+
 def download_ref_audio(ref_audio_input):
     """
     If ref_audio_input is a URL, download it to a temp file and return the path.
-    Handles Google Drive sharing links by converting to direct download URLs.
-    If it's already a local path or base64, return as-is.
+    Handles Google Drive sharing links. Always converts to WAV via ffmpeg
+    to guarantee compatibility with soundfile/librosa.
+    If it's already a local path, return as-is.
     """
     if not isinstance(ref_audio_input, str):
         return ref_audio_input, None  # already bytes or file-like
@@ -146,38 +175,86 @@ def download_ref_audio(ref_audio_input):
         return ref_audio_input, None  # local path, return as-is
 
     url = ref_audio_input
+    is_gdrive = False
 
-    # Convert Google Drive sharing links to direct download
+    # Detect Google Drive links
     gdrive_match = re.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', url)
     if gdrive_match:
         file_id = gdrive_match.group(1)
-        url = f"https://drive.google.com/uc?export=download&id={file_id}"
-        print(f"   🔗 Converted Google Drive link → direct download (ID: {file_id})")
+        is_gdrive = True
+        print(f"   🔗 Detected Google Drive file (ID: {file_id})")
 
-    print(f"   ⬇️ Downloading ref audio from URL...")
+    print(f"   ⬇️ Downloading ref audio...")
     t0 = time.time()
-    resp = requests.get(url, timeout=60, allow_redirects=True)
-    resp.raise_for_status()
-    print(f"   ✅ Downloaded {len(resp.content)} bytes in {time.time()-t0:.2f}s")
 
-    # Try to guess extension from Content-Type or URL
-    content_type = resp.headers.get("Content-Type", "")
-    if "wav" in content_type or url.endswith(".wav"):
-        ext = ".wav"
-    elif "flac" in content_type or url.endswith(".flac"):
-        ext = ".flac"
-    elif "ogg" in content_type or url.endswith(".ogg"):
-        ext = ".ogg"
-    elif "mp3" in content_type or "mpeg" in content_type or url.endswith(".mp3"):
-        ext = ".mp3"
+    if is_gdrive:
+        resp = _gdrive_download(file_id)
     else:
-        ext = ".wav"  # default fallback
+        resp = requests.get(url, timeout=60, allow_redirects=True)
+        resp.raise_for_status()
 
-    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-    tmp.write(resp.content)
-    tmp.close()
-    print(f"   💾 Saved to temp file: {tmp.name} ({ext})")
-    return tmp.name, tmp.name  # return (path_for_model, path_to_cleanup)
+    raw_bytes = resp.content
+    content_type = resp.headers.get("Content-Type", "")
+    print(f"   ✅ Downloaded {len(raw_bytes)} bytes in {time.time()-t0:.2f}s")
+    print(f"   📋 Content-Type: {content_type}")
+
+    # Sanity check: if content is HTML, the download failed
+    if raw_bytes[:50].strip().lower().startswith((b"<!doctype", b"<html")):
+        raise ValueError(
+            "Downloaded content is HTML, not audio. "
+            "Make sure the Google Drive file is shared as 'Anyone with the link'."
+        )
+
+    # Check if the content is base64-encoded audio (e.g. a .txt file with base64)
+    # Base64 audio starts with recognizable patterns like UklGR (RIFF/WAV header)
+    text_content = raw_bytes.strip()
+    is_base64 = False
+    if content_type.startswith("text/") or text_content[:10].isascii():
+        # Try to detect base64: check if it looks like pure base64 text
+        try:
+            sample = text_content[:100].decode("ascii", errors="strict")
+            # Base64 only contains A-Z, a-z, 0-9, +, /, = and whitespace
+            import string
+            b64_chars = set(string.ascii_letters + string.digits + "+/=\n\r\t ")
+            if all(c in b64_chars for c in sample):
+                # Try decoding a small chunk to verify
+                test_decode = base64.b64decode(text_content[:1000])
+                if len(test_decode) > 0:
+                    is_base64 = True
+        except Exception:
+            pass
+
+    if is_base64:
+        print(f"   🔓 Detected base64-encoded audio, decoding...")
+        raw_bytes = base64.b64decode(text_content)
+        print(f"   ✅ Decoded to {len(raw_bytes)} bytes of audio data")
+
+    # Save raw download to temp file (use generic extension)
+    raw_tmp = tempfile.NamedTemporaryFile(suffix=".download", delete=False)
+    raw_tmp.write(raw_bytes)
+    raw_tmp.close()
+
+    # Convert to WAV using ffmpeg for guaranteed compatibility
+    wav_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    wav_tmp.close()
+
+    print(f"   🔄 Converting to WAV via ffmpeg...")
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", raw_tmp.name, "-ar", "16000", "-ac", "1",
+             "-sample_fmt", "s16", wav_tmp.name],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            print(f"   ❌ ffmpeg stderr: {result.stderr[-500:]}")
+            raise RuntimeError(f"ffmpeg conversion failed: {result.stderr[-200:]}")
+        print(f"   ✅ Converted to WAV: {wav_tmp.name}")
+    finally:
+        # Clean up the raw download
+        if os.path.exists(raw_tmp.name):
+            os.remove(raw_tmp.name)
+
+    return wav_tmp.name, wav_tmp.name  # return (path_for_model, path_to_cleanup)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

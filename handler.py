@@ -5,10 +5,12 @@ import io
 import base64
 import gc
 import os
+import re
 import tempfile
 import numpy as np
 import time
 import warnings
+import requests
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ⚡ THREAD / ENV TUNING
@@ -128,6 +130,57 @@ print("--- ✅ Startup Complete ---")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Audio download helper (for voice cloning from URLs)
+# ──────────────────────────────────────────────────────────────────────────────
+def download_ref_audio(ref_audio_input):
+    """
+    If ref_audio_input is a URL, download it to a temp file and return the path.
+    Handles Google Drive sharing links by converting to direct download URLs.
+    If it's already a local path or base64, return as-is.
+    """
+    if not isinstance(ref_audio_input, str):
+        return ref_audio_input, None  # already bytes or file-like
+
+    # Check if it's a URL
+    if not ref_audio_input.startswith(("http://", "https://")):
+        return ref_audio_input, None  # local path, return as-is
+
+    url = ref_audio_input
+
+    # Convert Google Drive sharing links to direct download
+    gdrive_match = re.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', url)
+    if gdrive_match:
+        file_id = gdrive_match.group(1)
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        print(f"   🔗 Converted Google Drive link → direct download (ID: {file_id})")
+
+    print(f"   ⬇️ Downloading ref audio from URL...")
+    t0 = time.time()
+    resp = requests.get(url, timeout=60, allow_redirects=True)
+    resp.raise_for_status()
+    print(f"   ✅ Downloaded {len(resp.content)} bytes in {time.time()-t0:.2f}s")
+
+    # Try to guess extension from Content-Type or URL
+    content_type = resp.headers.get("Content-Type", "")
+    if "wav" in content_type or url.endswith(".wav"):
+        ext = ".wav"
+    elif "flac" in content_type or url.endswith(".flac"):
+        ext = ".flac"
+    elif "ogg" in content_type or url.endswith(".ogg"):
+        ext = ".ogg"
+    elif "mp3" in content_type or "mpeg" in content_type or url.endswith(".mp3"):
+        ext = ".mp3"
+    else:
+        ext = ".wav"  # default fallback
+
+    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    tmp.write(resp.content)
+    tmp.close()
+    print(f"   💾 Saved to temp file: {tmp.name} ({ext})")
+    return tmp.name, tmp.name  # return (path_for_model, path_to_cleanup)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Request handler
 # ──────────────────────────────────────────────────────────────────────────────
 def handler(job):
@@ -184,9 +237,17 @@ def handler(job):
                 gen_args["speaker"] = job_input.get("speaker", "Anna")
                 wavs, sr = model.generate_custom_voice(**gen_args)
             elif mode == "voice_clone":
-                gen_args["ref_audio"] = job_input.get("ref_audio")
+                raw_ref = job_input.get("ref_audio")
+                if not raw_ref:
+                    return {"error": "ref_audio is required for voice_clone mode."}
+                ref_path, tmp_audio_path = download_ref_audio(raw_ref)
+                gen_args["ref_audio"] = ref_path
                 gen_args["ref_text"] = job_input.get("ref_text")
-                wavs, sr = model.generate_voice_clone(**gen_args)
+                try:
+                    wavs, sr = model.generate_voice_clone(**gen_args)
+                finally:
+                    if tmp_audio_path and os.path.exists(tmp_audio_path):
+                        os.remove(tmp_audio_path)
 
         torch.cuda.synchronize()
         dt_gen = time.time() - t_gen

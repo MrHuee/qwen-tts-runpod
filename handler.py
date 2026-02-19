@@ -12,6 +12,7 @@ import time
 import warnings
 import requests
 import subprocess
+import soundfile as sf  # Required for manual loading
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ⚡ THREAD / ENV TUNING
@@ -21,14 +22,12 @@ os.environ["MKL_NUM_THREADS"] = "1"
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
-# Enable TF32 for potential speedup
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# --- CONFIGURATION: ONLY DESIGN AND CLONE ---
 MODEL_IDS = {
     "voice_design": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
     "voice_clone":  "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
@@ -42,7 +41,6 @@ WHISPER_MODEL = None
 # 🛠️ HELPER FUNCTIONS
 # ──────────────────────────────────────────────────────────────────────────────
 def set_seed(seed):
-    """Sets the seed for reproducibility to keep voice tone consistent."""
     if seed is not None:
         try:
             seed = int(seed)
@@ -54,9 +52,6 @@ def set_seed(seed):
             print(f"⚠️ Failed to set seed: {e}")
 
 def _load_tts(model_id, use_flash=True):
-    """
-    Robust model loader that handles Flash Attention 2 and dtype enforcement.
-    """
     from qwen_tts import Qwen3TTSModel
     print(f"--- 🛠️ Loading {model_id} (Flash={use_flash}) ---")
     kwargs = dict(
@@ -71,45 +66,30 @@ def _load_tts(model_id, use_flash=True):
     model = Qwen3TTSModel.from_pretrained(model_id, **kwargs)
     print(f"   ⏱️ Model load took {time.time() - t_start:.2f}s")
     
-    # 🩹 FIX: Explicitly set config dtype to silence warnings / ensure behavior
     if hasattr(model, "model") and hasattr(model.model, "config"):
         model.model.config.torch_dtype = torch.bfloat16
-        print("   🔧 Enforced config.torch_dtype = bfloat16")
-
-    try:
-        p = next(model.model.parameters())
-        print(f"   📊 Model: dtype={p.dtype}, device={p.device}")
-    except:
-        pass
 
     return model
 
 def load_target_model(target_mode):
     global CURRENT_MODEL, CURRENT_MODE
-    
-    # If we are already loaded, just return
     if CURRENT_MODE == target_mode and CURRENT_MODEL is not None:
         return CURRENT_MODEL
     
-    # If switching models, clear memory aggressively
     if CURRENT_MODEL is not None:
-        print("♻️ Unloading previous model to free VRAM...")
+        print("♻️ Unloading previous model...")
         del CURRENT_MODEL
         CURRENT_MODEL = None
         gc.collect()
         torch.cuda.empty_cache()
 
     model_id = MODEL_IDS.get(target_mode)
-    
-    # Try loading with Flash Attention 2 first (Fastest)
     try:
         model = _load_tts(model_id, use_flash=True)
         print("✅ Loaded: bfloat16 + Flash Attention 2")
     except Exception as e:
-        print(f"⚠️ FA2 failed ({e}), retrying with standard attention...")
-        # Fallback to standard attention if FA2 is not supported by the GPU
+        print(f"⚠️ FA2 failed ({e}), retrying with standard...")
         model = _load_tts(model_id, use_flash=False)
-        print("✅ Loaded: bfloat16 + standard attention")
 
     CURRENT_MODEL = model
     CURRENT_MODE = target_mode
@@ -124,7 +104,7 @@ def get_whisper_model():
     return WHISPER_MODEL
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 📥 DOWNLOAD HELPERS (GDrive + URL)
+# 📥 DOWNLOAD HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 def _gdrive_download(file_id):
     session = requests.Session()
@@ -145,12 +125,20 @@ def _gdrive_download(file_id):
     return resp
 
 def download_ref_audio(ref_audio_input):
+    """
+    Downloads audio from URL/GDrive, converts to 16kHz WAV via FFmpeg,
+    and returns path to the clean WAV file.
+    """
     if not isinstance(ref_audio_input, str):
         return ref_audio_input, None 
 
     if not ref_audio_input.startswith(("http://", "https://")):
+        # If it's a local path, ensure it exists
+        if os.path.exists(ref_audio_input):
+            return ref_audio_input, None
         return ref_audio_input, None 
 
+    # Download logic
     url = ref_audio_input
     gdrive_match = re.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', url)
     
@@ -163,23 +151,22 @@ def download_ref_audio(ref_audio_input):
 
     raw_bytes = resp.content
     
-    # Handle Base64 text file content
+    # Handle Base64 text content
     if resp.headers.get("Content-Type", "").startswith("text/") or raw_bytes[:10].isascii():
         try:
             text_content = raw_bytes.strip()
-            # Simple check if it looks like base64
             if len(text_content) > 100 and b" " not in text_content[0:50]: 
                 raw_bytes = base64.b64decode(text_content)
                 print("   🔓 Decoded base64 from URL")
         except:
             pass
 
-    # Save to temp file
+    # Save raw download
     raw_tmp = tempfile.NamedTemporaryFile(suffix=".download", delete=False)
     raw_tmp.write(raw_bytes)
     raw_tmp.close()
 
-    # Convert to WAV using ffmpeg (Standardizes any input format)
+    # Convert to standard 16kHz WAV
     wav_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     wav_tmp.close()
 
@@ -223,25 +210,24 @@ def handler(job):
             finally:
                 if os.path.exists(tmp_path): os.remove(tmp_path)
 
-        # === 2. TEXT-TO-SPEECH LOGIC ===
+        # === 2. TTS LOGIC ===
         if mode not in MODEL_IDS:
-            return {"error": f"Unknown mode '{mode}'. Use 'voice_design' or 'voice_clone'."}
+            return {"error": f"Unknown mode '{mode}'."}
 
         text = job_input.get("text", "")
         if not text: return {"error": "No text provided."}
 
-        # Setup Params
         user_max = job_input.get("max_new_tokens")
         max_tokens = int(user_max) if user_max else 1024
         
         # Load Model
         model = load_target_model(mode)
         
-        # Set Seed (Critical for Consistency)
-        seed = job_input.get("seed", 42) # Default to 42 if not provided
+        # Set Seed
+        seed = job_input.get("seed", 42)
         set_seed(seed)
 
-        print(f"--- 🗣️ GEN: {mode} | Len:{len(text)} | Seed:{seed} | Cache:True ---")
+        print(f"--- 🗣️ GEN: {mode} | Len:{len(text)} | Seed:{seed} ---")
         t_gen = time.time()
         
         with torch.inference_mode():
@@ -257,32 +243,52 @@ def handler(job):
                 gen_args["instruct"] = job_input.get("instruct", "Clear voice.")
                 wavs, sr = model.generate_voice_design(**gen_args)
 
-            # --- MODE B: VOICE CLONE ---
+            # --- MODE B: VOICE CLONE (The Fix!) ---
             elif mode == "voice_clone":
                 raw_ref = job_input.get("ref_audio")
-                ref_text = job_input.get("ref_text") # Transcript of the reference audio
+                ref_text = job_input.get("ref_text")
 
-                if not raw_ref:
-                    return {"error": "ref_audio is required for voice_clone mode."}
-                
-                # Download ref audio
-                ref_path, tmp_audio_path = download_ref_audio(raw_ref)
-                
-                # Set args
-                gen_args["ref_audio"] = ref_path
-                gen_args["ref_text"] = ref_text
+                if not raw_ref: return {"error": "ref_audio required"}
+                if not ref_text: return {"error": "ref_text required (transcript of audio)"}
+
+                # 1. Download & Convert Audio to file
+                ref_path, tmp_path = download_ref_audio(raw_ref)
                 
                 try:
-                    wavs, sr = model.generate_voice_clone(**gen_args)
+                    # 2. MANUALLY Load Audio into Memory (Numpy)
+                    # This ensures the model receives valid data, not just a path
+                    print(f"   🎤 Loading audio data from: {ref_path}")
+                    ref_audio_data, ref_audio_sr = sf.read(ref_path)
+                    
+                    # 3. Explicitly Create the Prompt Object
+                    # This step extracts the speaker embedding. If this fails, we catch it here.
+                    print("   🧠 Extracting voice embedding...")
+                    voice_clone_prompt = model.create_voice_clone_prompt(
+                        ref_audio=(ref_audio_data, ref_audio_sr), # Pass Tuple: (numpy, int)
+                        ref_text=ref_text
+                    )
+                    
+                    # 4. Generate using the Prompt Object
+                    print("   🗣️ Synthesizing speech...")
+                    wavs, sr = model.generate_voice_clone(
+                        text=text,
+                        language=job_input.get("language", "English"),
+                        voice_clone_prompt=voice_clone_prompt, # Pass the PROMPT, not the file
+                        max_new_tokens=max_tokens,
+                        use_cache=True
+                    )
+                except Exception as inner_e:
+                    print(f"❌ Cloning Failed during extraction: {inner_e}")
+                    raise inner_e # Re-raise to return error to n8n
                 finally:
-                    if tmp_audio_path and os.path.exists(tmp_audio_path):
-                        os.remove(tmp_audio_path)
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
 
         torch.cuda.synchronize()
         dt_gen = time.time() - t_gen
         print(f"⏱️ Generation took {dt_gen:.2f}s")
 
-        # Encode Output to Base64
+        # Encode Output
         raw_audio = wavs[0]
         if isinstance(raw_audio, np.ndarray):
             audio_tensor = torch.from_numpy(raw_audio).float()
@@ -309,5 +315,4 @@ def handler(job):
         print(f"❌ Error: {err}")
         return {"error": str(e), "traceback": err}
 
-# Start Runpod Worker
 runpod.serverless.start({"handler": handler})

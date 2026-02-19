@@ -6,6 +6,7 @@ import base64
 import gc
 import os
 import re
+import hashlib
 import tempfile
 import numpy as np
 import time
@@ -20,7 +21,6 @@ os.environ["MKL_NUM_THREADS"] = "1"
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 
-# Enable TF32 for potential speedup on Ampere+ GPUs (like A40)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -29,9 +29,50 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 MODEL_IDS = {
     "voice_design": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-    #"custom_voice": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
     "voice_clone":  "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
 }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 🎙️ BUNDLED VOICE REGISTRY
+# Maps friendly name → path inside the Docker image.
+# Add entries here + COPY the files in your Dockerfile / build context.
+# The "default" key is the fallback when no ref_audio is specified.
+# ──────────────────────────────────────────────────────────────────────────────
+VOICES_DIR = "/app/voices"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🎙️ VOICE REGISTRY
+# Maps friendly name → path inside the Docker image.
+# Any format ffmpeg supports: .mp3 .wav .m4a .flac
+#
+# ⚡ ZERO-REBUILD voice switching via RunPod env vars:
+#   Set  VOICE_DEFAULT_URL=https://...    to override "default" at runtime
+#   Set  VOICE_NARRATOR_URL=https://...   to add/override "narrator" at runtime
+#   Pattern: VOICE_<NAME_UPPERCASE>_URL=<url>
+#   handler.py downloads & caches these ONCE at startup — no image rebuild needed.
+# ─────────────────────────────────────────────────────────────────────────────
+VOICE_REGISTRY: dict[str, str] = {
+    # Bundled in the Docker image (baked in, always available):
+    "default": os.path.join(VOICES_DIR, "default.mp3"),  # Theo Silk – British Deep Sleep
+    # Add more bundled voices here (requires rebuild):
+    # "narrator": os.path.join(VOICES_DIR, "narrator.mp3"),
+}
+
+# Auto-register env-var voices (no rebuild needed — set in RunPod dashboard)
+# Pattern: VOICE_<NAME>_URL=https://cdn.example.com/voice.mp3
+# These are downloaded at startup and cached; the key becomes the lowercase name.
+_ENV_VOICE_URLS: dict[str, str] = {
+    k.removeprefix("VOICE_").removesuffix("_URL").lower(): v
+    for k, v in os.environ.items()
+    if k.startswith("VOICE_") and k.endswith("_URL")
+}
+if _ENV_VOICE_URLS:
+    print(f"   🌐 Found {len(_ENV_VOICE_URLS)} env-var voice(s): {list(_ENV_VOICE_URLS)}")
+
+# In-memory audio cache: sha256(audio_bytes) → converted_wav_path
+_AUDIO_CACHE: dict[str, str] = {}
+# Paths downloaded from env-var URLs (populated at startup)
+_ENV_VOICE_PATHS: dict[str, str] = {}
 
 CURRENT_MODEL = None
 CURRENT_MODE = None
@@ -46,7 +87,7 @@ def _load_tts(model_id, use_flash=True):
     kwargs = dict(
         device_map="cuda:0",
         dtype=torch.bfloat16,
-        torch_dtype=torch.bfloat16, 
+        torch_dtype=torch.bfloat16,
     )
     if use_flash:
         kwargs["attn_implementation"] = "flash_attention_2"
@@ -54,25 +95,24 @@ def _load_tts(model_id, use_flash=True):
     t_start = time.time()
     model = Qwen3TTSModel.from_pretrained(model_id, **kwargs)
     print(f"   ⏱️ Model load took {time.time() - t_start:.2f}s")
-    
-    # 🩹 FIX: Explicitly set config dtype to silence warnings / ensure behavior
+
     if hasattr(model, "model") and hasattr(model.model, "config"):
         model.model.config.torch_dtype = torch.bfloat16
-        print("   🔧 Enforced config.torch_dtype = bfloat16")
 
     try:
         p = next(model.model.parameters())
         print(f"   📊 Model: dtype={p.dtype}, device={p.device}")
-    except:
+    except Exception:
         pass
 
     return model
+
 
 def load_target_model(target_mode):
     global CURRENT_MODEL, CURRENT_MODE
     if CURRENT_MODE == target_mode and CURRENT_MODEL is not None:
         return CURRENT_MODEL
-    
+
     if CURRENT_MODEL is not None:
         del CURRENT_MODEL
         CURRENT_MODEL = None
@@ -93,8 +133,8 @@ def load_target_model(target_mode):
     CURRENT_MODE = target_mode
     return model
 
+
 def set_seed(seed):
-    """Sets the seed for reproducibility to keep voice tone consistent."""
     if seed is not None:
         try:
             seed = int(seed)
@@ -104,6 +144,7 @@ def set_seed(seed):
             print(f"🌱 Seed set to: {seed}")
         except Exception as e:
             print(f"⚠️ Failed to set seed: {e}")
+
 
 def get_whisper_model():
     global WHISPER_MODEL
@@ -115,19 +156,224 @@ def get_whisper_model():
         print(f"✅ Whisper ready ({time.time() - t0:.2f}s)")
     return WHISPER_MODEL
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 🎙️ AUDIO RESOLUTION — fast path for bundled voices, caching for everything else
+# ──────────────────────────────────────────────────────────────────────────────
+import subprocess
+
+
+def _convert_to_wav(raw_bytes: bytes, label: str = "") -> str:
+    """
+    Convert arbitrary audio bytes → 16 kHz mono WAV via ffmpeg.
+    Returns the path to a temp WAV file. Caller is responsible for cleanup
+    only if they chose to; bundled voices are left on disk permanently.
+    """
+    key = hashlib.sha256(raw_bytes).hexdigest()
+    if key in _AUDIO_CACHE:
+        print(f"   ⚡ Cache hit for audio{label} — skipping conversion")
+        return _AUDIO_CACHE[key]
+
+    raw_tmp = tempfile.NamedTemporaryFile(suffix=".download", delete=False)
+    raw_tmp.write(raw_bytes)
+    raw_tmp.close()
+
+    wav_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    wav_tmp.close()
+
+    print(f"   🔄 Converting{label} to WAV via ffmpeg...")
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", raw_tmp.name,
+             "-ar", "16000", "-ac", "1", "-sample_fmt", "s16", wav_tmp.name],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {result.stderr[-200:]}")
+        print(f"   ✅ Converted to WAV: {wav_tmp.name}")
+    finally:
+        if os.path.exists(raw_tmp.name):
+            os.remove(raw_tmp.name)
+
+    _AUDIO_CACHE[key] = wav_tmp.name
+    return wav_tmp.name
+
+
+def _preload_bundled_voice(name: str, path: str) -> None:
+    """Pre-convert a bundled WAV and warm the cache at startup."""
+    if not os.path.exists(path):
+        print(f"   ⚠️ Bundled voice '{name}' not found at {path}")
+        return
+    with open(path, "rb") as f:
+        raw = f.read()
+    # If it's already a clean WAV we trust it; still run through ffmpeg once
+    # to normalize sample-rate/format, then cache the result.
+    _convert_to_wav(raw, label=f" '{name}'")
+    print(f"   ✅ Bundled voice '{name}' cached")
+
+
+def resolve_ref_audio(ref_audio_input: str | None) -> tuple[str, bool]:
+    """
+    Resolve ref_audio to a ready-to-use WAV path.
+
+    Priority:
+      1. None / "default"    → bundled default voice (instant, pre-cached)
+      2. Registry name       → other bundled voice (instant, pre-cached)
+      3. Env-var voice name  → downloaded at startup, instant from cache
+      4. "data:audio/..."    → inline base64 data URI
+      5. Plain base64 str    → decode and convert
+      6. http/https URL      → download then convert (slowest — also cached after)
+      7. Local file path     → read and convert
+
+    Returns (wav_path, is_temp).
+      is_temp=True  → caller should delete after use
+      is_temp=False → cached/bundled file, do NOT delete
+    """
+    normalized = ref_audio_input.strip().lower() if isinstance(ref_audio_input, str) else None
+
+    # ── 1 & 2: Bundled registry ──────────────────────────────────────────────
+    if normalized is None or normalized == "default":
+        key = "default"
+    elif normalized in VOICE_REGISTRY:
+        key = normalized
+    else:
+        key = None
+
+    if key is not None:
+        path = VOICE_REGISTRY[key]
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Bundled voice '{key}' not found at {path}. "
+                "Did you COPY the voices/ folder into the Docker image?"
+            )
+        with open(path, "rb") as f:
+            raw = f.read()
+        h = hashlib.sha256(raw).hexdigest()
+        cached = _AUDIO_CACHE.get(h, path)
+        print(f"   ⚡ Using bundled voice '{key}': {cached}")
+        return cached, False
+
+    # ── 3: Env-var voice (downloaded at startup, instant) ────────────────────
+    if normalized in _ENV_VOICE_PATHS:
+        cached_path = _ENV_VOICE_PATHS[normalized]
+        print(f"   ⚡ Using env-var voice '{normalized}': {cached_path}")
+        return cached_path, False
+
+    # ── 4: Data URI ──────────────────────────────────────────────────────────
+    if isinstance(ref_audio_input, str) and ref_audio_input.startswith("data:"):
+        _, b64_part = ref_audio_input.split(",", 1)
+        raw_bytes = base64.b64decode(b64_part)
+        print(f"   📦 Received data URI ({len(raw_bytes)} bytes)")
+        return _convert_to_wav(raw_bytes, " (data URI)"), True
+
+    # ── 5: Plain base64 ──────────────────────────────────────────────────────
+    if isinstance(ref_audio_input, str) and not ref_audio_input.startswith(("http://", "https://", "/")):
+        try:
+            raw_bytes = base64.b64decode(ref_audio_input, validate=True)
+            print(f"   📦 Received base64 audio ({len(raw_bytes)} bytes)")
+            return _convert_to_wav(raw_bytes, " (base64)"), True
+        except Exception:
+            pass
+
+    # ── 6: URL ───────────────────────────────────────────────────────────────
+    if isinstance(ref_audio_input, str) and ref_audio_input.startswith(("http://", "https://")):
+        raw_bytes = _download_audio(ref_audio_input)
+        return _convert_to_wav(raw_bytes, " (URL)"), True
+
+    # ── 7: Local path ────────────────────────────────────────────────────────
+    if os.path.exists(ref_audio_input):
+        with open(ref_audio_input, "rb") as f:
+            raw_bytes = f.read()
+        return _convert_to_wav(raw_bytes, " (local file)"), True
+
+    raise ValueError(f"Cannot resolve ref_audio: {str(ref_audio_input)[:120]}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# URL / Google Drive download (kept as slow fallback)
+# ──────────────────────────────────────────────────────────────────────────────
+def _gdrive_download(file_id: str) -> bytes:
+    session = requests.Session()
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    resp = session.get(url, timeout=60, allow_redirects=True)
+    resp.raise_for_status()
+
+    if b"</html>" in resp.content[:5000].lower() or b"confirm" in resp.content[:5000].lower():
+        confirm_match = re.search(r'confirm=([0-9A-Za-z_-]+)', resp.text)
+        if confirm_match:
+            resp = session.get(url + f"&confirm={confirm_match.group(1)}", timeout=60)
+        else:
+            resp = session.get(url + "&confirm=t", timeout=60)
+        resp.raise_for_status()
+
+    return resp.content
+
+
+def _download_audio(url: str) -> bytes:
+    print(f"   ⬇️ Downloading ref audio from URL...")
+    t0 = time.time()
+
+    gdrive_match = re.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', url)
+    if gdrive_match:
+        raw = _gdrive_download(gdrive_match.group(1))
+    else:
+        resp = requests.get(url, timeout=60, allow_redirects=True)
+        resp.raise_for_status()
+        raw = resp.content
+
+    if raw[:50].strip().lower().startswith((b"<!doctype", b"<html")):
+        raise ValueError("Downloaded content is HTML, not audio.")
+
+    # Detect base64-encoded content in a text response
+    try:
+        sample = raw.strip()[:100].decode("ascii", errors="strict")
+        import string
+        b64_chars = set(string.ascii_letters + string.digits + "+/=\n\r\t ")
+        if all(c in b64_chars for c in sample):
+            raw = base64.b64decode(raw.strip())
+    except Exception:
+        pass
+
+    print(f"   ✅ Downloaded {len(raw)} bytes in {time.time()-t0:.2f}s")
+    return raw
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 🔥 STARTUP PRELOAD
 # ──────────────────────────────────────────────────────────────────────────────
-print("--- 🔥 Preloading models... ---")
+print("--- 🔥 Preloading models and voices... ---")
+
+# Pre-cache all bundled voices (from Docker image) so first request is instant
+for _name, _path in VOICE_REGISTRY.items():
+    _preload_bundled_voice(_name, _path)
+
+# Download & cache env-var voices (VOICE_<NAME>_URL) at startup
+# These are instant from cache for every request after boot.
+for _env_name, _env_url in _ENV_VOICE_URLS.items():
+    try:
+        print(f"   ⬇️ Downloading env-var voice '{_env_name}' from {_env_url[:60]}...")
+        _raw = _download_audio(_env_url)
+        _wav_path = _convert_to_wav(_raw, label=f" '{_env_name}' (env)")
+        _ENV_VOICE_PATHS[_env_name] = _wav_path
+        # If this is overriding the default, also update the registry path cache
+        if _env_name == "default":
+            # Re-hash the new bytes so resolve_ref_audio finds it via bundled path too
+            _h = hashlib.sha256(_raw).hexdigest()
+            _AUDIO_CACHE[_h] = _wav_path
+            print(f"   ✅ Env-var DEFAULT voice ready (overrides bundled): {_wav_path}")
+        else:
+            print(f"   ✅ Env-var voice '{_env_name}' ready: {_wav_path}")
+    except Exception as _e:
+        print(f"   ⚠️ Failed to load env-var voice '{_env_name}': {_e}")
+
 try:
     load_target_model("voice_design")
     print("--- ⏱️ CUDA warmup ---")
     t0 = time.time()
     with torch.inference_mode():
-        # Pass use_cache=True explicitly
         _ = CURRENT_MODEL.generate_voice_design(
             text="Hi.", language="English", instruct="Warmup.",
-            max_new_tokens=50, use_cache=True
+            max_new_tokens=50, use_cache=True,
         )
     torch.cuda.synchronize()
     print(f"✅ Warmup done in {time.time() - t0:.2f}s")
@@ -138,135 +384,8 @@ try:
     get_whisper_model()
 except Exception as e:
     print(f"⚠️ Whisper preload failed: {e}")
+
 print("--- ✅ Startup Complete ---")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Audio download helper (for voice cloning from URLs)
-# ──────────────────────────────────────────────────────────────────────────────
-import subprocess
-
-def _gdrive_download(file_id):
-    """Download from Google Drive, handling the virus-scan confirmation page."""
-    session = requests.Session()
-    url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    resp = session.get(url, timeout=60, allow_redirects=True)
-    resp.raise_for_status()
-
-    # Check if we got the confirmation page (large files / virus scan)
-    # Google returns HTML with a confirm token we need to accept
-    if b"</html>" in resp.content[:5000].lower() or b"confirm" in resp.content[:5000].lower():
-        # Try to extract the confirm token
-        import re as _re
-        confirm_match = _re.search(r'confirm=([0-9A-Za-z_-]+)', resp.text)
-        if confirm_match:
-            confirm_token = confirm_match.group(1)
-            print(f"   🔑 Got GDrive confirm token, retrying...")
-            resp = session.get(url + f"&confirm={confirm_token}", timeout=60, allow_redirects=True)
-            resp.raise_for_status()
-        else:
-            # Try with confirm=t (common workaround)
-            print(f"   🔑 Trying GDrive confirm=t workaround...")
-            resp = session.get(url + "&confirm=t", timeout=60, allow_redirects=True)
-            resp.raise_for_status()
-
-    return resp
-
-def download_ref_audio(ref_audio_input):
-    """
-    If ref_audio_input is a URL, download it to a temp file and return the path.
-    Handles Google Drive sharing links. Always converts to WAV via ffmpeg
-    to guarantee compatibility with soundfile/librosa.
-    If it's already a local path, return as-is.
-    """
-    if not isinstance(ref_audio_input, str):
-        return ref_audio_input, None  # already bytes or file-like
-
-    # Check if it's a URL
-    if not ref_audio_input.startswith(("http://", "https://")):
-        return ref_audio_input, None  # local path, return as-is
-
-    url = ref_audio_input
-    is_gdrive = False
-
-    # Detect Google Drive links
-    gdrive_match = re.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', url)
-    if gdrive_match:
-        file_id = gdrive_match.group(1)
-        is_gdrive = True
-        print(f"   🔗 Detected Google Drive file (ID: {file_id})")
-
-    print(f"   ⬇️ Downloading ref audio...")
-    t0 = time.time()
-
-    if is_gdrive:
-        resp = _gdrive_download(file_id)
-    else:
-        resp = requests.get(url, timeout=60, allow_redirects=True)
-        resp.raise_for_status()
-
-    raw_bytes = resp.content
-    content_type = resp.headers.get("Content-Type", "")
-    print(f"   ✅ Downloaded {len(raw_bytes)} bytes in {time.time()-t0:.2f}s")
-    print(f"   📋 Content-Type: {content_type}")
-
-    # Sanity check: if content is HTML, the download failed
-    if raw_bytes[:50].strip().lower().startswith((b"<!doctype", b"<html")):
-        raise ValueError(
-            "Downloaded content is HTML, not audio. "
-            "Make sure the Google Drive file is shared as 'Anyone with the link'."
-        )
-
-    # Check if the content is base64-encoded audio (e.g. a .txt file with base64)
-    # Base64 audio starts with recognizable patterns like UklGR (RIFF/WAV header)
-    text_content = raw_bytes.strip()
-    is_base64 = False
-    if content_type.startswith("text/") or text_content[:10].isascii():
-        # Try to detect base64: check if it looks like pure base64 text
-        try:
-            sample = text_content[:100].decode("ascii", errors="strict")
-            # Base64 only contains A-Z, a-z, 0-9, +, /, = and whitespace
-            import string
-            b64_chars = set(string.ascii_letters + string.digits + "+/=\n\r\t ")
-            if all(c in b64_chars for c in sample):
-                # Try decoding a small chunk to verify
-                test_decode = base64.b64decode(text_content[:1000])
-                if len(test_decode) > 0:
-                    is_base64 = True
-        except Exception:
-            pass
-
-    if is_base64:
-        print(f"   🔓 Detected base64-encoded audio, decoding...")
-        raw_bytes = base64.b64decode(text_content)
-        print(f"   ✅ Decoded to {len(raw_bytes)} bytes of audio data")
-
-    # Save raw download to temp file (use generic extension)
-    raw_tmp = tempfile.NamedTemporaryFile(suffix=".download", delete=False)
-    raw_tmp.write(raw_bytes)
-    raw_tmp.close()
-
-    # Convert to WAV using ffmpeg for guaranteed compatibility
-    wav_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    wav_tmp.close()
-
-    print(f"   🔄 Converting to WAV via ffmpeg...")
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", raw_tmp.name, "-ar", "16000", "-ac", "1",
-             "-sample_fmt", "s16", wav_tmp.name],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            print(f"   ❌ ffmpeg stderr: {result.stderr[-500:]}")
-            raise RuntimeError(f"ffmpeg conversion failed: {result.stderr[-200:]}")
-        print(f"   ✅ Converted to WAV: {wav_tmp.name}")
-    finally:
-        # Clean up the raw download
-        if os.path.exists(raw_tmp.name):
-            os.remove(raw_tmp.name)
-
-    return wav_tmp.name, wav_tmp.name  # return (path_for_model, path_to_cleanup)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -278,85 +397,88 @@ def handler(job):
         job_input = job.get("input", {})
         mode = job_input.get("mode", "voice_design").lower()
 
+        # ── Transcribe mode ──────────────────────────────────────────────────
         if mode == "transcribe":
             audio_b64 = job_input.get("audio_base64")
-            if not audio_b64: return {"error": "No audio_base64 provided."}
+            if not audio_b64:
+                return {"error": "No audio_base64 provided."}
             import whisper_timestamped as whisper
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp.write(base64.b64decode(audio_b64))
                 tmp_path = tmp.name
             try:
-                t_trans = time.time()
                 wmodel = get_whisper_model()
                 audio = whisper.load_audio(tmp_path)
                 with torch.inference_mode():
                     result = whisper.transcribe(wmodel, audio, language="en")
                 return {"status": "success", "transcription": result}
             finally:
-                if os.path.exists(tmp_path): os.remove(tmp_path)
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
-        if mode not in MODEL_IDS: return {"error": f"Unknown mode {mode}"}
+        if mode not in MODEL_IDS:
+            return {"error": f"Unknown mode '{mode}'. Valid: {list(MODEL_IDS.keys())}"}
 
         text = job_input.get("text", "")
-        if not text: return {"error": "No text."}
+        if not text:
+            return {"error": "No text provided."}
 
-        # Dynamic max_new_tokens (default 1024 ~85s)
-        # Explicitly enabling use_cache for speed
         user_max = job_input.get("max_new_tokens")
         max_tokens = int(user_max) if user_max else 1024
 
         model = load_target_model(mode)
-        
+
         print(f"--- 🗣️ GEN: {mode} | Len:{len(text)} | Max:{max_tokens} | Cache:True ---")
         t_gen = time.time()
-        
+
         with torch.inference_mode():
-            # Common kwargs for speed
             gen_args = dict(
-                text=text, 
+                text=text,
                 language=job_input.get("language", "English"),
                 max_new_tokens=max_tokens,
-                use_cache=True,  # 🚀 CRITICAL FOR SPEED
+                use_cache=True,
             )
 
             if mode == "voice_design":
                 gen_args["instruct"] = job_input.get("instruct", "Clear voice.")
                 wavs, sr = model.generate_voice_design(**gen_args)
-            #elif mode == "custom_voice":
-            #    gen_args["speaker"] = job_input.get("speaker", "Anna")
-            #    wavs, sr = model.generate_custom_voice(**gen_args)
+
             elif mode == "voice_clone":
-                raw_ref = job_input.get("ref_audio")
-                if not raw_ref:
-                    return {"error": "ref_audio is required for voice_clone mode."}
-                ref_path, tmp_audio_path = download_ref_audio(raw_ref)
+                # ── ref_audio resolution ─────────────────────────────────────
+                # Accepts:
+                #   "default"          → bundled default voice (fastest)
+                #   "<voice_name>"     → other bundled voice (fastest)
+                #   "<base64_string>"  → custom audio encoded as base64
+                #   "data:audio/..."   → data URI
+                #   "https://..."      → URL (slow fallback)
+                raw_ref = job_input.get("ref_audio")  # None → uses default
+                ref_path, is_temp = resolve_ref_audio(raw_ref)
+
                 gen_args["ref_audio"] = ref_path
                 gen_args["ref_text"] = job_input.get("ref_text")
                 try:
                     wavs, sr = model.generate_voice_clone(**gen_args)
                 finally:
-                    if tmp_audio_path and os.path.exists(tmp_audio_path):
-                        os.remove(tmp_audio_path)
+                    # Only delete if it was a one-shot temp file, not a cached/bundled one
+                    if is_temp and ref_path and os.path.exists(ref_path):
+                        # Don't delete if it ended up in the cache (reused later)
+                        if ref_path not in _AUDIO_CACHE.values():
+                            os.remove(ref_path)
 
         torch.cuda.synchronize()
         dt_gen = time.time() - t_gen
-        
-        # Calculate Tokens/Sec heuristic (approx)
-        # Using 12Hz as frame rate
-        # 45s audio = 540 frames. 
-        # But we don't know exact frames generated without inspecting output.
-        # Just log time.
         print(f"⏱️ Generation took {dt_gen:.2f}s")
 
-        # Encode
+        # ── Encode output ─────────────────────────────────────────────────────
         raw_audio = wavs[0]
         if isinstance(raw_audio, np.ndarray):
             audio_tensor = torch.from_numpy(raw_audio).float()
         elif torch.is_tensor(raw_audio):
-             audio_tensor = raw_audio.detach().cpu().float()
-        
-        if audio_tensor.dim() == 1: audio_tensor = audio_tensor.unsqueeze(0)
-        
+            audio_tensor = raw_audio.detach().cpu().float()
+
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+
         byte_io = io.BytesIO()
         torchaudio.save(byte_io, audio_tensor, sr, format="wav")
         audio_b64 = base64.b64encode(byte_io.getvalue()).decode("utf-8")
@@ -364,9 +486,12 @@ def handler(job):
         dt_total = time.time() - t_start
         print(f"✅ Complete in {dt_total:.2f}s (Gen: {dt_gen:.2f}s)")
         return {
-            "status": "success", 
+            "status": "success",
             "audio_base64": audio_b64,
-            "stats": {"total_time": f"{dt_total:.2f}s", "generation_time": f"{dt_gen:.2f}s"}
+            "stats": {
+                "total_time": f"{dt_total:.2f}s",
+                "generation_time": f"{dt_gen:.2f}s",
+            },
         }
 
     except Exception as e:
@@ -374,5 +499,6 @@ def handler(job):
         err = traceback.format_exc()
         print(f"❌ Error: {err}")
         return {"error": str(e), "traceback": err}
+
 
 runpod.serverless.start({"handler": handler})
